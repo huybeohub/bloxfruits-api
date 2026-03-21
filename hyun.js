@@ -7,42 +7,79 @@ app.use(cors());
 app.use(express.json());
 
 let servers = [];
+let ripIndraServers = new Set(); // Lưu server có Rip Indra
 
+// Cập nhật danh sách server
 async function updateServers() {
     try {
         const res = await axios.get('https://games.roblox.com/v1/games/2753915549/servers/Public?sortOrder=Asc&limit=100');
-        servers = res.data.data;
+        servers = res.data.data.filter(s => s.playing < 15); // Chỉ server ít người
         console.log(`✅ Loaded ${servers.length} servers`);
     } catch(e) {
-        console.log('❌ Server update failed');
+        console.log('❌ Update failed');
     }
 }
 
-// Routes
-app.get('/', (req, res) => res.send('🚀 Blox Fruits Hop API OK!'));
-
-app.get('/api/servers', (req, res) => {
-    res.json(servers);
-});
-
-app.get('/api/find-boss/:boss', (req, res) => {
-    // Tìm boss hoặc random server
-    const bossServer = servers.find(s => s.playing > 5) || servers[0];
+// API chính: Tìm Rip Indra
+app.get('/api/rip-indra', async (req, res) => {
+    // Kiểm tra cache trước
+    if (ripIndraServers.size > 0) {
+        const serverList = servers.filter(s => ripIndraServers.has(s.id));
+        if (serverList.length > 0) {
+            return res.json({
+                status: "found",
+                boss: "Rip Indra",
+                servers: serverList.map(s => ({
+                    jobId: s.id,
+                    name: s.name,
+                    players: s.playing,
+                    ping: s.ping || 0
+                }))
+            });
+        }
+    }
+    
+    // Không tìm thấy
     res.json({
-        status: 'found',
-        server: bossServer || { id: '1234567890', name: 'Low Player Server' }
+        status: "not_found",
+        message: "No Rip Indra servers found",
+        randomServer: servers[0] ? {
+            jobId: servers[0].id,
+            name: servers[0].name,
+            players: servers[0].playing
+        } : null
     });
 });
 
+// Nhận thông báo từ Roblox server
 app.post('/api/boss-spawned', (req, res) => {
-    console.log('🔔 Boss detected:', req.body.boss);
+    const { boss, jobId } = req.body;
+    
+    if (boss === "Rip Indra") {
+        ripIndraServers.add(jobId);
+        console.log(`🔔 RIP INDRAS spawn! JobId: ${jobId}`);
+        
+        // Auto xóa sau 5 phút
+        setTimeout(() => {
+            ripIndraServers.delete(jobId);
+            console.log(`⏰ RIP INDRAS ${jobId} expired`);
+        }, 300000);
+    }
+    
     res.json({ success: true });
 });
 
-// Start server
+// Test endpoint
+app.get('/', (req, res) => res.send(`
+    🚀 RIP INDRAS HOP API<br>
+    📡 /api/rip-indra → Lấy Job ID<br>
+    📤 POST /api/boss-spawned → Report boss
+`));
+
+// Start
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-    console.log(`🚀 API running on port ${port}`);
+    console.log(`🚀 RIP INDRAS API on port ${port}`);
     updateServers();
-    setInterval(updateServers, 30000);
+    setInterval(updateServers, 20000); // Update 20s
 });
