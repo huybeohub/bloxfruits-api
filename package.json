@@ -1,9 +1,9 @@
 {
-  "name": "bloxfruits-api",
+  "name": "bloxfruits-hop-api",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "hyun.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node hyun.js"
   },
   "dependencies": {
     "express": "^4.18.2",
