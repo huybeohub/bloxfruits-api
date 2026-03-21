@@ -5,81 +5,77 @@ const axios = require('axios');
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.static('public'));
 
-let servers = [];
-let ripIndraServers = new Set(); // Lưu server có Rip Indra
+let allServers = [];
+let ripIndraServers = new Map(); // jobId -> server info
 
-// Cập nhật danh sách server
-async function updateServers() {
+// Auto fetch servers mỗi 15s
+async function fetchServers() {
     try {
         const res = await axios.get('https://games.roblox.com/v1/games/2753915549/servers/Public?sortOrder=Asc&limit=100');
-        servers = res.data.data.filter(s => s.playing < 15); // Chỉ server ít người
-        console.log(`✅ Loaded ${servers.length} servers`);
+        allServers = res.data.data;
+        console.log(`📊 Fetched ${allServers.length} servers`);
     } catch(e) {
-        console.log('❌ Update failed');
+        console.error('Fetch error:', e.message);
     }
 }
 
-// API chính: Tìm Rip Indra
-app.get('/api/rip-indra', async (req, res) => {
-    // Kiểm tra cache trước
-    if (ripIndraServers.size > 0) {
-        const serverList = servers.filter(s => ripIndraServers.has(s.id));
-        if (serverList.length > 0) {
-            return res.json({
-                status: "found",
-                boss: "Rip Indra",
-                servers: serverList.map(s => ({
-                    jobId: s.id,
-                    name: s.name,
-                    players: s.playing,
-                    ping: s.ping || 0
-                }))
+// RIP INDRAS API - Real JSON only
+app.get('/api/rip-indra', (req, res) => {
+    const ripServers = [];
+    
+    // Filter servers có Rip Indra từ cache
+    for (let [jobId, serverInfo] of ripIndraServers) {
+        const fullServer = allServers.find(s => s.id === jobId);
+        if (fullServer) {
+            ripServers.push({
+                jobId: fullServer.id,
+                name: fullServer.name || 'Unknown',
+                players: fullServer.playing || 0,
+                maxPlayers: fullServer.maxPlayers || 12,
+                ping: fullServer.ping || 999,
+                lastSeen: serverInfo.lastSeen
             });
         }
     }
     
-    // Không tìm thấy
     res.json({
-        status: "not_found",
-        message: "No Rip Indra servers found",
-        randomServer: servers[0] ? {
-            jobId: servers[0].id,
-            name: servers[0].name,
-            players: servers[0].playing
-        } : null
+        status: ripServers.length > 0 ? 'success' : 'empty',
+        count: ripServers.length,
+        servers: ripServers,
+        lastUpdate: new Date().toISOString(),
+        totalServers: allServers.length
     });
 });
 
-// Nhận thông báo từ Roblox server
+// Report boss spawn
 app.post('/api/boss-spawned', (req, res) => {
     const { boss, jobId } = req.body;
-    
-    if (boss === "Rip Indra") {
-        ripIndraServers.add(jobId);
-        console.log(`🔔 RIP INDRAS spawn! JobId: ${jobId}`);
+    if (boss === 'Rip Indra') {
+        ripIndraServers.set(jobId, {
+            lastSeen: Date.now(),
+            reports: (ripIndraServers.get(jobId)?.reports || 0) + 1
+        });
         
-        // Auto xóa sau 5 phút
-        setTimeout(() => {
-            ripIndraServers.delete(jobId);
-            console.log(`⏰ RIP INDRAS ${jobId} expired`);
-        }, 300000);
+        // Cleanup cũ hơn 5 phút
+        setTimeout(() => ripIndraServers.delete(jobId), 300000);
+        console.log(`🔔 RIP INDRAS reported: ${jobId}`);
     }
-    
     res.json({ success: true });
 });
 
-// Test endpoint
-app.get('/', (req, res) => res.send(`
-    🚀 RIP INDRAS HOP API<br>
-    📡 /api/rip-indra → Lấy Job ID<br>
-    📤 POST /api/boss-spawned → Report boss
-`));
+// Debug - All servers
+app.get('/api/debug', (req, res) => res.json({
+    ripIndraCount: ripIndraServers.size,
+    totalServers: allServers.length,
+    allServers: allServers.slice(0, 5) // First 5
+}));
 
 // Start
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-    console.log(`🚀 RIP INDRAS API on port ${port}`);
-    updateServers();
-    setInterval(updateServers, 20000); // Update 20s
+    console.log(`🚀 API + UI on port ${port}`);
+    fetchServers();
+    setInterval(fetchServers, 15000); // 15s update
 });
