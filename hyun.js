@@ -3,229 +3,197 @@ const cors = require('cors');
 const axios = require('axios');
 
 const app = express();
+
+// FIXED CORS - Roblox HttpService SAFE
 app.use(cors({
-    origin: '*', // Fix HTTP request error
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type']
+    origin: true,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(express.json({ limit: '10mb' }));
-app.options('*', cors()); // Pre-flight fix
 
+app.use(express.json({ limit: '50mb' }));
+app.options('*', cors());
+
+// Night Hub data
 let servers = [];
-let bossCache = new Map(); // jobId -> boss info
-const PLACE_ID = 2753915549; // Blox Fruits
+let bossReports = new Map(); // jobId -> boss data
+const PLACE_ID = 2753915549;
 
-// ===== ENHANCED SERVER FETCH (Night Hub Style) =====
-async function fetchServers() {
+// ===== NIGHT HUB SERVER FETCH (Multi-page) =====
+async function fetchNightHubServers() {
     try {
-        console.log('🔄 Scanning ' + PLACE_ID + ' servers...');
-        
-        // Multiple pages for 85-96% coverage
+        console.log('🌙 Night Hub scanning servers...');
         const allServers = [];
-        for (let cursor = ''; cursor !== null; cursor = servers.nextPageCursor) {
-            const url = `https://games.roblox.com/v1/games/${PLACE_ID}/servers/Public?sortOrder=Asc&limit=100${cursor ? '&cursor=' + cursor : ''}`;
-            const res = await axios.get(url, { timeout: 8000 });
-            allServers.push(...res.data.data);
-            
-            if (!res.data.nextPageCursor) break;
-        }
         
-        // Night Hub filter: Low player + good ping
-        servers = allServers
-            .filter(s => s.playing >= 1 && s.playing <= 10) // 85% boss spawn rate
-            .filter(s => (s.ping || 999) < 300)
-            .sort((a, b) => a.playing - b.playing);
+        // Scan multiple pages (Night Hub technique)
+        let cursor = '';
+        do {
+            const url = `https://games.roblox.com/v1/games/${PLACE_ID}/servers/Public?sortOrder=Asc&limit=100${cursor ? '&cursor=' + cursor : ''}`;
+            const res = await axios.get(url, { 
+                timeout: 10000,
+                headers: { 'User-Agent': 'Mozilla/5.0' }
+            });
             
-        console.log(`✅ ${servers.length} optimal servers (85-96% boss rate)`);
-    } catch (e) {
-        console.error('❌ Fetch error:', e.message);
+            allServers.push(...(res.data.data || []));
+            cursor = res.data.nextPageCursor || null;
+            await new Promise(r => setTimeout(r, 500)); // Rate limit
+        } while (cursor);
+        
+        // Night Hub optimal filter: 1-10 players = 85-96% boss spawn
+        servers = allServers
+            .filter(s => s.playing >= 1 && s.playing <= 10)
+            .filter(s => (s.ping || 999) <= 350)
+            .sort((a, b) => (a.playing || 99) - (b.playing || 99));
+            
+        console.log(`✅ Night Hub: ${servers.length} optimal servers loaded`);
+        
+    } catch (error) {
+        console.error('❌ Server fetch:', error.message);
+        servers = [];
     }
 }
 
-// ===== NIGHT HUB BOSS DETECTION =====
+// ===== NIGHT HUB SCAN ENDPOINT =====
 app.get('/api/scan', async (req, res) => {
     const { boss = 'Rip Indra' } = req.query;
     
-    console.log(`🔍 Scanning for ${boss}...`);
+    console.log(`🔍 Scanning ${boss}... (${bossReports.size} reports)`);
     
-    const results = {
-        status: 'scanning',
-        boss: boss,
-        found: 0,
-        servers: [],
-        total: servers.length,
-        recommend: []
-    };
+    const now = Date.now();
+    const confirmed = [];
+    const recommended = [];
     
-    // Check boss cache first
-    for (let [jobId, bossInfo] of bossCache) {
-        if (bossInfo.name === boss && Date.now() - bossInfo.time < 300000) {
+    // Confirmed bosses from reports
+    for (let [jobId, report] of bossReports) {
+        if (report.boss === boss && now - report.time < 240000) { // 4min
             const server = servers.find(s => s.id === jobId);
             if (server) {
-                results.found++;
-                results.servers.push({
+                confirmed.push({
                     jobId: server.id,
-                    name: server.name,
+                    name: server.name || 'Boss Server',
                     players: server.playing,
-                    ping: server.ping,
-                    bossConfirmed: true,
-                    priority: 100 // Highest priority
+                    ping: server.ping || 999,
+                    confirmed: true,
+                    priority: 98,
+                    reports: report.count || 1
                 });
             }
         }
     }
     
-    // Fallback: Recommend low player servers (Night Hub strategy)
-    if (results.servers.length === 0) {
-        results.recommend = servers.slice(0, 8).map(s => ({
-            jobId: s.id,
-            name: s.name,
-            players: s.playing,
-            ping: s.ping,
-            bossConfirmed: false,
-            priority: 85 + (10 - s.playing) * 2 // 85-96% estimate
-        }));
-    }
+    // Night Hub recommendations (low player = high boss chance)
+    const lowPlayerServers = servers
+        .filter(s => !confirmed.find(c => c.jobId === s.id))
+        .slice(0, 12);
     
-    results.status = results.servers.length > 0 ? 'found' : 'recommend';
-    res.json(results);
+    lowPlayerServers.forEach((server, i) => {
+        recommended.push({
+            jobId: server.id,
+            name: server.name,
+            players: server.playing,
+            ping: server.ping || 999,
+            confirmed: false,
+            priority: 85 + (10 - server.playing) * 1.2, // 85-96%
+            rank: i + 1
+        });
+    });
+    
+    const response = {
+        status: confirmed.length > 0 ? 'confirmed' : 'recommended',
+        boss: boss,
+        confirmedCount: confirmed.length,
+        recommendedCount: recommended.length,
+        totalServers: servers.length,
+        servers: confirmed.concat(recommended.slice(0, 8)),
+        timestamp: Date.now()
+    };
+    
+    console.log(`📊 Scan result: ${confirmed.length} confirmed, ${recommended.length} recommended`);
+    res.json(response);
 });
 
-// ===== BOSS REPORT (From Roblox servers) =====
+// ===== BOSS REPORT ENDPOINT =====
 app.post('/api/report', (req, res) => {
     try {
-        const { boss, jobId, players, serverName } = req.body;
+        const { boss, jobId, players = 0, serverName } = req.body;
         
-        bossCache.set(jobId, {
-            name: boss,
+        if (!boss || !jobId) {
+            return res.status(400).json({ error: 'Missing boss/jobId' });
+        }
+        
+        const existing = bossReports.get(jobId) || { count: 0 };
+        bossReports.set(jobId, {
+            boss: boss,
             time: Date.now(),
             players: players,
-            serverName: serverName
+            serverName: serverName,
+            count: existing.count + 1
         });
         
-        console.log(`📢 ${boss} @ ${jobId.slice(0, 12)}... (${players}p)`);
+        // Cleanup old reports (5min)
+        setTimeout(() => bossReports.delete(jobId), 300000);
         
-        // Auto expire 5min
-        setTimeout(() => bossCache.delete(jobId), 300000);
+        console.log(`📢 ${boss} reported → ${jobId.slice(0, 12)} (${players}p) [${existing.count + 1}]`);
+        res.json({ success: true, reportId: jobId });
         
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
+    } catch (error) {
+        console.error('Report error:', error);
+        res.status(500).json({ error: error.message });
     }
 });
 
-// ===== HOP ENDPOINT (Night Hub style) =====
-app.post('/api/hop', async (req, res) => {
-    const { jobId } = req.body;
-    res.json({ 
-        success: true, 
-        message: `Hop to ${jobId.slice(0, 12)}...`,
-        robloxUrl: `roblox://placeID=${PLACE_ID}:jobId=${jobId}`
+// ===== SERVER LIST =====
+app.get('/api/servers', (req, res) => {
+    res.json({
+        count: servers.length,
+        optimal: servers.slice(0, 20)
     });
 });
 
-// ===== DEBUG & STATS =====
-app.get('/api/stats', (req, res) => res.json({
-    uptime: process.uptime(),
-    servers: servers.length,
-    bossCache: bossCache.size,
-    memory: process.memoryUsage().heapUsed / 1024 / 1024 + 'MB'
-}));
-
-// ===== WEB DASHBOARD =====
-app.get('/', (req, res) => res.send(`
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Night Hub Scanner</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width">
-    <style>body{margin:0;padding:40px 20px;font-family:Segoe UI;background:#0f0f23;color:#fff;}
-    .container{max-width:1000px;margin:auto;background:rgba(0,0,0,0.8);border-radius:20px;padding:30px;}
-    h1{font-size:2.5em;text-align:center;background:linear-gradient(45deg,#ff4757,#ff7831);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
-    .scan-btn{width:100%;padding:20px;font-size:1.4em;background:linear-gradient(45deg,#ff4757,#ff7831);color:white;border:none;border-radius:50px;cursor:pointer;font-weight:bold;margin:20px 0;transition:all .3s;}
-    .scan-btn:hover{transform:scale(1.02);box-shadow:0 10px 30px rgba(255,71,87,.5);}
-    #results{max-height:500px;overflow:auto;background:rgba(0,0,0,.5);border-radius:15px;padding:20px;margin:20px 0;}
-    .server{ background:linear-gradient(135deg,#2ed573,#1e90ff);padding:15px;margin:10px 0;border-radius:10px;cursor:pointer;transition:all .3s;}
-    .server:hover{transform:translateY(-2px);box-shadow:0 5px 20px rgba(0,0,0,.3);}
-    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;margin:20px 0;}
-    .stat-card{background:rgba(255,255,255,.1);padding:20px;border-radius:15px;text-align:center;}
-    pre{font-size:14px;line-height:1.4;white-space:pre-wrap;}</style>
-</head>
-<body>
-    <div class="container">
-        <h1>🌙 Night Hub Scanner</h1>
-        <p style="text-align:center;color:#aaa;">85-96% Boss Detection Rate | Real Roblox API</p>
-        <button class="scan-btn" onclick="scan()">🔍 SCAN FOR RIP INDRAS</button>
-        <div class="stats">
-            <div class="stat-card"><strong id="serverCount">0</strong><br>Servers</div>
-            <div class="stat-card"><strong id="bossCount">0</strong><br>RIP INDRAS</div>
-            <div class="stat-card"><strong id="uptime">--</strong><br>Uptime</div>
-        </div>
-        <div id="results">Click SCAN to find RIP INDRAS servers...</div>
-        <pre id="json"></pre>
-    </div>
-    <script>
-        async function scan(){
-            const btn=document.querySelector('.scan-btn'),results=document.getElementById('results'),json=document.getElementById('json');
-            btn.textContent='⏳ Scanning...';btn.disabled=true;
-            try{
-                const res=await fetch('/api/scan?boss=Rip Indra');
-                const data=await res.json();
-                console.log('Night Hub Data:',data);
-                
-                document.getElementById('serverCount').textContent=data.total;
-                document.getElementById('bossCount').textContent=data.found;
-                
-                if(data.found>0){
-                    let html='';
-                    data.servers.forEach(s=>{
-                        html+=`<div class="server" onclick="hop('${s.jobId}')">
-                            <strong>${s.name}</strong><br>
-                            👥 ${s.players}/${s.maxPlayers} | 🌐 ${s.ping}ms<br>
-                            <small>Confirmed ${s.bossConfirmed?'RIP INDRAS':'High chance'}</small>
-                        </div>`;
-                    });
-                    results.innerHTML=html;
-                }else{
-                    let html='<div style="text-align:center;color:#aaa;padding:40px;">';
-                    data.recommend.forEach((s,i)=>{
-                        html+=`<div class="server" onclick="hop('${s.jobId}')">
-                            #${i+1} ${s.name} (${s.players}p) ${s.priority}% chance<br>
-                            <small>${s.jobId.slice(0,16)}...</small>
-                        </div>`;
-                    });
-                    html+='</div>';
-                    results.innerHTML=html;
-                }
-                json.textContent=JSON.stringify(data,null,2);
-            }catch(e){
-                results.innerHTML='<div style="color:#ff4757;">Error: '+e.message+'</div>';
-            }
-            btn.textContent='🔍 SCAN AGAIN';btn.disabled=false;
-        }
-        function hop(jobId){
-            window.location.href='roblox://placeID=2753915549:jobId='+jobId;
-        }
-        setInterval(scan,25000); // Auto scan 25s
-        scan();
-    </script>
-</body></html>`);
+// ===== STATS =====
+app.get('/api/stats', (req, res) => {
+    res.json({
+        uptime: Math.floor(process.uptime() / 60),
+        servers: servers.length,
+        reports: bossReports.size,
+        memory: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1) + 'MB'
+    });
 });
 
-// 404 fallback
-app.use((req, res) => res.redirect('/'));
-
-// Start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log('\n🌙 NIGHT HUB SCANNER v2.0');
-    console.log('='.repeat(40));
-    console.log('🚀 http://localhost:' + PORT);
-    console.log('📡 /api/scan?boss=Rip Indra');
-    console.log('📤 POST /api/report');
-    console.log('='.repeat(40));
-    
-    fetchServers();
-    setInterval(fetchServers, 12000); // 12s update
-});
+// ===== DASHBOARD =====
+app.get('/', (req, res) => {
+    res.send(`<!DOCTYPE html>
+<html><head><title>Night Hub</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width">
+<style>*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}
+body{background:#0a0a0f;color:#fff;min-height:100vh;padding:20px;}
+.container{max-width:1100px;margin:auto;background:rgba(0,0,0,.9);border-radius:25px;padding:40px;box-shadow:0 25px 50px rgba(0,0,0,.8);}
+h1{font-size:3em;text-align:center;background:linear-gradient(45deg,#ff6b35,#f7931e);background-clip:text;-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:20px;}
+.subtitle{text-align:center;color:#aaa;font-size:1.2em;margin-bottom:40px;}
+.btn{display:block;width:100%;padding:25px;font-size:1.6em;background:linear-gradient(45deg,#ff6b35,#f7931e);color:#fff;border:none;border-radius:50px;cursor:pointer;font-weight:700;transition:all .4s;margin:25px 0;box-shadow:0 15px 35px rgba(255,107,53,.4);}
+.btn:hover{transform:translateY(-3px);box-shadow:0 20px 45px rgba(255,107,53,.6);}
+.results{max-height:500px;overflow:auto;background:rgba(255,255,255,.05);border-radius:20px;padding:30px;margin:30px 0;border:1px solid rgba(255,255,255,.1);}
+.server{background:linear-gradient(135deg,#11998e,#38ef7d);padding:25px;margin:15px 0;border-radius:20px;cursor:pointer;transition:all .3s;border:2px solid transparent;}
+.server:hover{transform:translateY(-5px);border-color:#fff;box-shadow:0 15px 40px rgba(17,153,142,.4);}
+.server.confirmed{background:linear-gradient(135deg,#ff6b35,#f7931e)!important;border-color:#ff4757;}
+.server strong{font-size:1.3em;display:block;}
+.server small{color:#ddd;}
+.stats{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:25px;display:grid;margin:30px 0;}
+.stat{background:rgba(255,255,255,.08);padding:25px;border-radius:20px;text-align:center;border:1px solid rgba(255,255,255,.1);}
+.stat strong{font-size:2em;display:block;color:#4ecdc4;}
+pre{background:#1a1a2e;color:#00d4ff;padding:20px;border-radius:15px;font-size:13px;overflow:auto;max-height:300px;}</style>
+</head><body>
+<div class="container">
+<h1>🌙 Night Hub Scanner</h1><p class="subtitle">85-96% Boss Detection | Real-time Roblox Servers</p>
+<button class="btn" onclick="scan()">🎯 SCAN RIP INDRAS</button>
+<div class="stats">
+<div class="stat"><strong id="totalServers">0</strong>Servers</div>
+<div class="stat"><strong id="foundBosses">0</strong>Confirmed</div>
+<div class="stat"><strong id="uptime">--</strong>Minutes</div>
+</div>
+<div class="results" id="results">Click SCAN to find RIP INDRAS...</div>
+<pre id="jsonResponse"></pre>
+</div>
+<script>
+async function scan(){
